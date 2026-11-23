@@ -19,6 +19,8 @@ updates, new skills, and doc updates, so documentation keeps up with the code.
 Thoth is one plugin for every repository. The engine lives in the plugin; each repository keeps
 only its own `.claude/skills/` folder.
 
+Originally created by Ari Evans at [Marioario/thoth](https://github.com/Marioario/thoth).
+
 ## Install
 
 **For an organization** (recommended): an Owner adds this under claude.ai → Organization
@@ -29,7 +31,7 @@ their next session start and can't turn it off.
 {
   "extraKnownMarketplaces": {
     "thoth": {
-      "source": { "source": "github", "repo": "Marioario/thoth" },
+      "source": { "source": "github", "repo": "lessthan3/thoth" },
       "autoUpdate": true
     }
   },
@@ -40,11 +42,11 @@ their next session start and can't turn it off.
 **For yourself**:
 
 ```bash
-claude plugin marketplace add Marioario/thoth
+claude plugin marketplace add lessthan3/thoth
 claude plugin install thoth@thoth
 ```
 
-Or inside Claude Code: `/plugin install thoth --marketplace Marioario/thoth` (Claude Code
+Or inside Claude Code: `/plugin install thoth --marketplace lessthan3/thoth` (Claude Code
 2.1.275 or later).
 
 ## Set Up a Repository
