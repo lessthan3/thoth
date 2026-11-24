@@ -105,7 +105,7 @@ skill files and commit `.claude/skills/`.
 - `path`: the skill file to load, relative to `.claude/skills/`
 - `promptTriggers.keywords`: words that activate it
 - `promptTriggers.intentPatterns`: regex patterns for intent matching
-- `fileTriggers.pathPatterns`: glob patterns for file-based matching
+- `fileTriggers.pathPatterns`: glob patterns for file-based matching (`*`, `**`, `?`, `{a,b}`)
 - `skills`: specific skills within the domain
 - `subdomains`: nested domains (e.g. `frontend/studio`)
 
@@ -167,7 +167,7 @@ running Claude Code's built-in `/code-review`. To use your own reviewer, put an 
 `code-reviewer` in `~/.claude/agents/` (just for you) or `.claude/agents/` (for the repository).
 
 When the gate blocks `gh pr create`, Claude runs the checks, commits any fixes, and retries the
-command with `# pre-pr-checks-done` appended as a bash comment. The gate only starts for `gh pr`
+command with `# pre-pr-checks-done` appended as a bash comment. The gate only starts for `gh`
 commands, and if it fails, the command is blocked rather than let through.
 
 ## Migrating from the copied install
