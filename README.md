@@ -23,6 +23,9 @@ Originally created by Ari Evans at [Marioario/thoth](https://github.com/Marioari
 
 ## Install
 
+Requires Claude Code 2.1.295 or later: older clients ignore `onFailure: "block"`, so a crashing
+gate would let `gh pr create` through. See [Requirements](#requirements).
+
 **For an organization** (recommended): an Owner adds this under claude.ai → Organization
 settings → Claude Code → Managed settings. Everyone signed in to the organization gets Thoth at
 their next session start and can't turn it off.
@@ -46,8 +49,7 @@ claude plugin marketplace add lessthan3/thoth
 claude plugin install thoth@thoth
 ```
 
-Or inside Claude Code: `/plugin install thoth --marketplace lessthan3/thoth` (Claude Code
-2.1.275 or later).
+Or inside Claude Code: `/plugin install thoth --marketplace lessthan3/thoth`.
 
 ## Set Up a Repository
 

@@ -10,7 +10,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"fs.rmSync('plugin/dist', { recursive: true, force: true })\" && tsc",
     "check": "tsc --noEmit",
     "validate": "claude plugin validate . && claude plugin validate ./plugin"
   },

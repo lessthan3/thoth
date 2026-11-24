@@ -14,8 +14,11 @@
 
 import { hasSkillRules, useProjectFrom } from './project.mjs';
 
-const PR_CREATE = /\bgh\s+pr\s+(create|new)\b/;
+// `-R/--repo` is a `gh pr` option, so it can sit between `pr` and `create`.
+const PR_CREATE = /\bgh\s+pr(?:\s+(?:-R|--repo)(?:=|\s+)\S+)*\s+(create|new)\b/;
 const MARKER = 'pre-pr-checks-done';
+// Only the documented trailing bash comment counts, not the word inside a title or body.
+const MARKER_COMMENT = new RegExp(`(^|\\s)#\\s*${MARKER}\\s*$`);
 
 function denyReason(checkSkills: boolean): string {
   const steps: string[] = [];
@@ -63,7 +66,7 @@ async function main(): Promise<void> {
     return; // Not a payload we understand: leave the command alone.
   }
 
-  if (!PR_CREATE.test(command) || command.includes(MARKER)) return;
+  if (!PR_CREATE.test(command) || MARKER_COMMENT.test(command)) return;
   useProjectFrom(cwd);
 
   process.stdout.write(

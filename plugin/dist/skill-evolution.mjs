@@ -357,12 +357,15 @@ function detectStaleDocs(files, rules, source) {
 // ============================================================================
 function matchesGlobPattern(filePath, pattern) {
     try {
+        // Escape regex metacharacters (e.g. Next.js `app/(marketing)/**`), then translate globs:
+        // `**/` is zero or more directories, `**` anything, `*` anything within one segment.
         const regexPattern = pattern
-            .replace(/\./g, '\\.') // Escape dots FIRST (for files like schema.prisma)
-            .replace(/\*\*/g, '###GLOB_DOUBLE###') // Placeholder to prevent conflict
-            .replace(/\*/g, '[^/]*') // Single * matches within directory
-            .replace(/###GLOB_DOUBLE###/g, '.*') // ** matches across directories
-            .replace(/\//g, '\\/'); // Escape slashes
+            .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+            .replace(/\*\*\//g, '\u0000')
+            .replace(/\*\*/g, '\u0001')
+            .replace(/\*/g, '[^/]*')
+            .replace(/\u0000/g, '(?:.*/)?')
+            .replace(/\u0001/g, '.*');
         return new RegExp(`^${regexPattern}$`).test(filePath);
     }
     catch {
@@ -539,6 +542,10 @@ function newSkillTarget(filePath) {
     const dir = parent.split('/').slice(0, 3).join('/');
     return { dir, skillName: dir.replace(/\//g, '-') };
 }
+/** Single-quote for bash: names come from repo paths, which a contributor controls. */
+function shellQuote(s) {
+    return `'${s.replace(/'/g, `'\\''`)}'`;
+}
 function newSkillPath(domain, skillName) {
     return existsSync(join(SKILLS_DIR, domain, 'SKILL.md')) ? `${domain}/${skillName}` : skillName;
 }
@@ -627,13 +634,15 @@ function generateSuggestions(files, patterns, rules, source) {
                 // Never suggest a scaffold that would overwrite an existing skill.
                 if (existsSync(join(skillsDir, skillPath, 'SKILL.md')))
                     continue;
+                const quotedDir = shellQuote(`${skillsDir}/${skillPath}`);
+                const quotedFile = shellQuote(`${skillsDir}/${skillPath}/SKILL.md`);
                 suggestions.push({
                     type: 'new',
                     skillName,
                     domain,
                     reason: `${dirFiles.length} files changed in ${dir} with no skill coverage`,
                     suggestedContent: dirFiles.slice(0, 5).map((f) => f.path),
-                    scaffoldCommand: `mkdir -p "${skillsDir}/${skillPath}" && cat > "${skillsDir}/${skillPath}/SKILL.md" << 'EOF'
+                    scaffoldCommand: `mkdir -p ${quotedDir} && cat > ${quotedFile} << 'EOF'
 ---
 name: ${skillName}
 description: "[What this covers]. Use when [tasks that should load it]."
