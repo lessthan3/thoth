@@ -11,18 +11,15 @@
  * 5. Better skills guide future development
  *
  * Usage:
- * - Runs automatically on PR creation (via PreToolUse hook on `gh pr create`)
- * - Runs via /check-skills command
- * - Can be run directly: npx tsx skill-evolution.ts
+ * - Runs when a prompt mentions opening a PR (via the skill activation hook)
+ * - Runs via the /thoth:check-skills skill
+ * - Can be run directly from a repository: node <plugin>/dist/skill-evolution.mjs
  */
 
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync, statSync } from 'fs';
 import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
-import { execSync } from 'child_process';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+import { execFileSync } from 'child_process';
+import { PROJECT_DIR, SKILLS_DIR, SKILL_RULES_PATH } from './project.mjs';
 
 // ============================================================================
 // Types
@@ -63,14 +60,36 @@ interface SkillRulesConfig {
   defaultPriority?: string;
   maxSuggestionsPerLevel?: number;
   evolutionPatterns?: EvolutionPattern[];
+  /**
+   * Regex for a changed line that alters a public API, used by `docs` entries without
+   * `anyChange`. Unset means every change to a watched file counts.
+   */
+  publicApiPattern?: string;
   [key: string]: unknown;
 }
 
 interface SkillRules {
   version: string;
   domains: Record<string, SkillNode>;
+  docs?: DocEntry[];
   config?: SkillRulesConfig;
   globalPatterns?: GlobalPattern[];
+}
+
+interface DocEntry {
+  path: string; // repo-relative path to the Docs/*.md file
+  package: string;
+  description: string;
+  watch: string[]; // glob patterns whose changes should be reflected in this doc
+  anyChange?: boolean; // flag on any change, not just public-API changes
+}
+
+interface DocSuggestion {
+  docPath: string;
+  package: string;
+  description: string;
+  exists: boolean;
+  triggeringFiles: string[];
 }
 
 interface GlobalPattern {
@@ -88,6 +107,8 @@ interface FileChange {
   deletions: number;
   isNew: boolean;
 }
+
+type ChangeSource = 'committed' | 'working-tree';
 
 interface PatternDetection {
   pattern: string;
@@ -117,120 +138,147 @@ interface SkillSuggestion {
 // Git Analysis (with CI/shallow clone support)
 // ============================================================================
 
-function getChangedFiles(baseBranch = 'main'): FileChange[] {
-  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+function parseNumstat(output: string): FileChange[] {
+  return output
+    .trim()
+    .split('\n')
+    .filter((line) => line.trim())
+    .map((line) => {
+      const parts = line.split('\t');
+      const [additions, deletions, path] = parts;
+      return {
+        path: path || '',
+        additions: parseInt(additions) || 0,
+        deletions: parseInt(deletions) || 0,
+        isNew: deletions === '0' || parseInt(deletions) === 0,
+      };
+    })
+    // Exclude .claude changes from analysis
+    .filter((f) => f.path && !f.path.startsWith('.claude/'));
+}
 
-  // Allow CI to override the target branch
-  const target = process.env.GITHUB_BASE_REF || process.env.BASE_BRANCH || baseBranch;
-
+/**
+ * Runs git with an argument list, never a shell: refs come from skill-rules.json and env vars,
+ * which a cloned repository controls. Returns null when git fails (usually an unknown ref).
+ */
+function git(args: string[]): string | null {
   try {
-    // Try multiple strategies for different git contexts
-    const commands = [
-      `git diff --numstat origin/${target}...HEAD`,
-      `git diff --numstat ${target}...HEAD`,
-      `git diff --numstat HEAD~1...HEAD`,
-      `git show --numstat --format="" HEAD`, // Fallback for single-commit scenarios
-    ];
-
-    let output = '';
-    for (const cmd of commands) {
-      try {
-        output = execSync(cmd, {
-          encoding: 'utf-8',
-          cwd: projectDir,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-        if (output.trim()) break;
-      } catch {
-        continue;
-      }
-    }
-
-    if (!output.trim()) return [];
-
-    return output
-      .trim()
-      .split('\n')
-      .filter((line) => line.trim())
-      .map((line) => {
-        const parts = line.split('\t');
-        const [additions, deletions, path] = parts;
-        return {
-          path: path || '',
-          additions: parseInt(additions) || 0,
-          deletions: parseInt(deletions) || 0,
-          isNew: deletions === '0' || parseInt(deletions) === 0,
-        };
-      })
-      .filter((f) => f.path && !f.path.startsWith('.claude/')); // Exclude .claude changes from analysis
+    return execFileSync('git', args, {
+      encoding: 'utf-8',
+      cwd: PROJECT_DIR,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
   } catch {
-    return [];
+    return null;
   }
+}
+
+const branchPoints = new Map<string, string | null>();
+
+/**
+ * The commit this branch forked from: the merge-base of HEAD and the first base ref that
+ * resolves (`origin/<base>`, then `<base>`). The base comes from GITHUB_BASE_REF, BASE_BRANCH or
+ * config.baseBranch; anything that isn't a valid branch name (including `-option` lookalikes) is
+ * ignored. Null when no base resolves, e.g. a shallow CI clone or no remote.
+ */
+function branchPoint(baseBranch: string): string | null {
+  const target = process.env.GITHUB_BASE_REF || process.env.BASE_BRANCH || baseBranch;
+  if (branchPoints.has(target)) return branchPoints.get(target)!;
+
+  let point: string | null = null;
+  if (git(['check-ref-format', '--branch', target]) !== null) {
+    for (const ref of [`refs/remotes/origin/${target}`, `refs/heads/${target}`]) {
+      point = git(['merge-base', ref, 'HEAD'])?.trim() || null;
+      if (point) break;
+    }
+  }
+  branchPoints.set(target, point);
+  return point;
+}
+
+function splitLines(output: string | null): string[] {
+  return (output ?? '').trim().split('\n').filter(Boolean);
+}
+
+/**
+ * Untracked files never appear in `git diff`, so an all-new branch would read as
+ * empty. Enumerated separately rather than via `git add -N`, which would mutate
+ * the user's index.
+ */
+function getUntrackedFiles(projectDir: string): FileChange[] {
+  return splitLines(git(['ls-files', '--others', '--exclude-standard']))
+    .filter((p) => !p.startsWith('.claude/'))
+    .map((p) => {
+      let additions = 0;
+      try {
+        const full = join(projectDir, p);
+        if (statSync(full).size <= 1_000_000) {
+          const text = readFileSync(full, 'utf-8');
+          // Count lines like git: a trailing newline doesn't start a new line.
+          additions = text.split('\n').length - (text === '' || text.endsWith('\n') ? 1 : 0);
+        }
+      } catch {
+        // Unreadable: still worth reporting as a new file.
+      }
+      return { path: p, additions, deletions: 0, isNew: true };
+    });
+}
+
+function getChangedFiles(baseBranch = 'main'): { files: FileChange[]; source: ChangeSource } {
+  const projectDir = PROJECT_DIR;
+  const point = branchPoint(baseBranch);
+
+  if (point) {
+    // A base-relative diff is authoritative: if the base resolves, its answer
+    // stands even when empty (branch is level with its base). Decide on the raw
+    // diff, before parseNumstat drops `.claude/` paths: a branch that only
+    // commits skill edits still has committed work.
+    const committed = git(['diff', '--numstat', point, 'HEAD']);
+    if (committed?.trim()) {
+      // Analyze the branch as it stands, uncommitted edits included, so a skill
+      // or doc Claude just updated counts as updated before it's committed.
+      const files = parseNumstat(git(['diff', '--numstat', point]) ?? committed);
+      return { files: files.concat(getUntrackedFiles(projectDir)), source: 'committed' };
+    }
+  } else {
+    // No base to compare against: guess from the last commit.
+    const last =
+      git(['diff', '--numstat', 'HEAD~1', 'HEAD']) ??
+      git(['show', '--numstat', '--format=', 'HEAD']);
+    if (last?.trim()) return { files: parseNumstat(last), source: 'committed' };
+  }
+
+  // Nothing committed to analyze — fall back to the working tree so an
+  // in-progress change doesn't report a clean bill of health. Without a HEAD
+  // (fresh repo) the diff fails and only untracked files apply.
+  const working = parseNumstat(git(['diff', '--numstat', 'HEAD']) ?? '').concat(
+    getUntrackedFiles(projectDir)
+  );
+  return working.length > 0
+    ? { files: working, source: 'working-tree' }
+    : { files: [], source: 'committed' };
 }
 
 function getRecentCommitMessages(count = 10): string[] {
-  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-
-  try {
-    const output = execSync(`git log --oneline -${count}`, {
-      encoding: 'utf-8',
-      cwd: projectDir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    return output.trim().split('\n').filter(Boolean);
-  } catch {
-    return [];
-  }
+  return splitLines(git(['log', '--oneline', `-${count}`]));
 }
 
 function getCurrentBranch(): string {
-  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-
-  try {
-    return execSync('git branch --show-current', {
-      encoding: 'utf-8',
-      cwd: projectDir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
-  } catch {
-    return 'unknown';
-  }
+  return git(['branch', '--show-current'])?.trim() || 'unknown';
 }
 
-function getModifiedSkillFiles(baseBranch = 'main'): Set<string> {
-  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const target = process.env.GITHUB_BASE_REF || process.env.BASE_BRANCH || baseBranch;
-
-  try {
-    const commands = [
-      `git diff --name-only origin/${target}...HEAD -- .claude/skills/`,
-      `git diff --name-only ${target}...HEAD -- .claude/skills/`,
-    ];
-
-    for (const cmd of commands) {
-      try {
-        const output = execSync(cmd, {
-          encoding: 'utf-8',
-          cwd: projectDir,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-        if (output.trim()) {
-          return new Set(
-            output
-              .trim()
-              .split('\n')
-              .filter(Boolean)
-              .map((p) => p.replace(/^\.claude\/skills\//, ''))
-          );
-        }
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return new Set();
+/**
+ * Skill files already edited on this branch, committed or not, relative to `.claude/skills/`.
+ * Diffing against the branch point (not a possibly stale local base) keeps upstream skill edits
+ * from counting as this branch's.
+ */
+function getModifiedSkillFiles(baseBranch = 'main', source: ChangeSource = 'committed') {
+  const point = source === 'committed' ? branchPoint(baseBranch) : null;
+  const paths = [
+    ...splitLines(git(['diff', '--name-only', point ?? 'HEAD', '--', '.claude/skills/'])),
+    ...splitLines(git(['ls-files', '--others', '--exclude-standard', '--', '.claude/skills/'])),
+  ];
+  return new Set(paths.map((p) => p.replace(/^\.claude\/skills\//, '')));
 }
 
 /**
@@ -239,8 +287,7 @@ function getModifiedSkillFiles(baseBranch = 'main'): Set<string> {
  * Returns paths normalized to repo-relative form (no leading slash).
  */
 function getSkillReferencedPaths(skillRelativePath: string): Set<string> {
-  const skillsDir = join(__dirname, '..', 'skills');
-  const fullPath = join(skillsDir, skillRelativePath);
+  const fullPath = join(SKILLS_DIR, skillRelativePath);
   const paths = new Set<string>();
 
   try {
@@ -253,7 +300,7 @@ function getSkillReferencedPaths(skillRelativePath: string): Set<string> {
     }
 
     // Pattern 2: "Key Files" list items: `- /path/to/file.ts - Description`
-    const listPaths = content.matchAll(/^[-*]\s+\/?([a-zA-Z][\w.-]*(?:\/[\w.-]+)+\.\w+)/gm);
+    const listPaths = content.matchAll(/^[ \t]*[-*]\s+\/?([a-zA-Z][\w.-]*(?:\/[\w.-]+)+\.\w+)/gm);
     for (const match of listPaths) {
       paths.add(match[1]);
     }
@@ -270,18 +317,144 @@ function getSkillReferencedPaths(skillRelativePath: string): Set<string> {
   return paths;
 }
 
+/**
+ * True when this file's diff adds or removes a line matching the repository's
+ * `publicApiPattern`, i.e. the change is visible to consumers and therefore
+ * something the docs may need to describe.
+ */
+function diffTouchesPublicApi(diff: string, publicApi: RegExp): boolean {
+  // Only read hunk bodies: a removed `-- comment` line looks like a `---` header.
+  let inHunk = false;
+  return diff.split('\n').some((l) => {
+    if (l.startsWith('@@')) inHunk = true;
+    else if (l.startsWith('diff --git')) inHunk = false;
+    else if (inHunk && (l.startsWith('+') || l.startsWith('-'))) return publicApi.test(l.slice(1));
+    return false;
+  });
+}
+
+function touchesPublicApi(
+  filePath: string,
+  baseBranch: string,
+  source: ChangeSource,
+  publicApi: RegExp,
+): boolean {
+  const point = source === 'committed' ? branchPoint(baseBranch) : null;
+  const diffs: string[][] =
+    source === 'working-tree' || point
+      ? [['diff', '-U0', point ?? 'HEAD', '--', filePath]]
+      : [
+          ['diff', '-U0', 'HEAD~1', 'HEAD', '--', filePath],
+          ['show', '-U0', '--format=', 'HEAD', '--', filePath],
+        ];
+
+  for (const args of diffs) {
+    const output = git(args);
+    if (output?.trim()) return diffTouchesPublicApi(output, publicApi);
+  }
+
+  // Untracked: no diff to read, so judge the whole file.
+  if (!splitLines(git(['ls-files', '--others', '--exclude-standard', '--', filePath])).length) {
+    return false;
+  }
+  try {
+    const content = readFileSync(join(PROJECT_DIR, filePath), 'utf-8');
+    return content.split('\n').some((l) => publicApi.test(l));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Flags package Docs whose subject matter changed in this branch but which
+ * weren't themselves updated. Consumer-facing docs (integration notes, event
+ * API, telemetry) drift silently otherwise.
+ */
+function detectStaleDocs(
+  files: FileChange[],
+  rules: SkillRules | null,
+  source: ChangeSource
+): DocSuggestion[] {
+  if (!rules?.docs?.length) return [];
+
+  const projectDir = PROJECT_DIR;
+  const baseBranch = rules.config?.baseBranch || 'main';
+  const changedPaths = new Set(files.map((f) => f.path));
+  const publicApiCache = new Map<string, boolean>();
+  let publicApi: RegExp | null = null;
+  try {
+    if (rules.config?.publicApiPattern) publicApi = new RegExp(rules.config.publicApiPattern);
+  } catch {
+    // Invalid regex in config: treat every change as relevant rather than none.
+    console.error(`Ignoring invalid config.publicApiPattern: ${rules.config?.publicApiPattern}`);
+  }
+  const suggestions: DocSuggestion[] = [];
+
+  for (const doc of rules.docs) {
+    if (!Array.isArray(doc.watch)) {
+      console.error(`Ignoring docs entry without a watch array: ${doc.path}`);
+      continue;
+    }
+    // Git reports repo-relative paths; accept `./Docs/x.md` or `/Docs/x.md` in config.
+    const docPath = doc.path.replace(/^(\.\/|\/)+/, '');
+    // Doc already updated in this branch — nothing to nag about.
+    if (changedPaths.has(docPath)) continue;
+
+    const triggeringFiles = files
+      .filter((f) => f.path !== docPath)
+      .filter((f) => doc.watch.some((p) => matchesGlobPattern(f.path, p)))
+      .filter((f) => {
+        if (doc.anyChange || !publicApi) return true;
+        if (!publicApiCache.has(f.path)) {
+          publicApiCache.set(f.path, touchesPublicApi(f.path, baseBranch, source, publicApi));
+        }
+        return publicApiCache.get(f.path)!;
+      })
+      .map((f) => f.path);
+
+    if (triggeringFiles.length === 0) continue;
+
+    suggestions.push({
+      docPath: doc.path,
+      package: doc.package,
+      description: doc.description,
+      exists: existsSync(join(projectDir, docPath)),
+      triggeringFiles,
+    });
+  }
+
+  return suggestions;
+}
+
 // ============================================================================
 // Improved Glob Matching (with proper dot escaping)
 // ============================================================================
 
 function matchesGlobPattern(filePath: string, pattern: string): boolean {
   try {
-    const regexPattern = pattern
-      .replace(/\./g, '\\.') // Escape dots FIRST (for files like schema.prisma)
-      .replace(/\*\*/g, '###GLOB_DOUBLE###') // Placeholder to prevent conflict
-      .replace(/\*/g, '[^/]*') // Single * matches within directory
-      .replace(/###GLOB_DOUBLE###/g, '.*') // ** matches across directories
-      .replace(/\//g, '\\/'); // Escape slashes
+    // `**/` is zero or more directories, `**` anything, `*` anything within one segment, `?` one
+    // character, `{a,b}` either. Everything else is literal (e.g. Next.js `app/(marketing)/**`).
+    let regexPattern = '';
+    let braces = 0;
+    for (let i = 0; i < pattern.length; i++) {
+      const c = pattern[i];
+      if (pattern.startsWith('**/', i)) {
+        regexPattern += '(?:.*/)?';
+        i += 2;
+      } else if (pattern.startsWith('**', i)) {
+        regexPattern += '.*';
+        i += 1;
+      } else if (c === '*') regexPattern += '[^/]*';
+      else if (c === '?') regexPattern += '[^/]';
+      else if (c === '{') {
+        braces++;
+        regexPattern += '(?:';
+      } else if (c === '}' && braces > 0) {
+        braces--;
+        regexPattern += ')';
+      } else if (c === ',' && braces > 0) regexPattern += '|';
+      else regexPattern += c.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+    }
 
     return new RegExp(`^${regexPattern}$`).test(filePath);
   } catch {
@@ -319,7 +492,9 @@ function detectPatterns(
       patterns.push({
         pattern: 'significant-directory-change',
         files: files.filter((f) => dirname(f.path) === dir).map((f) => f.path),
-        description: `High velocity change in ${dir}: ${stats.count} files, ${stats.additions} lines added`,
+        description:
+          `High velocity change in ${dir}: ${stats.count} files, ` +
+          `${stats.additions} lines added`,
       });
     }
   });
@@ -368,7 +543,11 @@ function detectPatterns(
       const matchingFiles = files.filter((f) => {
         return gp.rules.some((rule) => {
           const pathMatches = matchesGlobPattern(f.path, rule.path);
-          const typeMatches = !rule.type || rule.type === 'any' || (rule.type === 'new' && f.isNew) || (rule.type === 'modified' && !f.isNew);
+          const typeMatches =
+            !rule.type ||
+            rule.type === 'any' ||
+            (rule.type === 'new' && f.isNew) ||
+            (rule.type === 'modified' && !f.isNew);
           return pathMatches && typeMatches;
         });
       });
@@ -391,9 +570,8 @@ function detectPatterns(
 // ============================================================================
 
 function loadSkillRules(): SkillRules | null {
-  const rulesPath = join(__dirname, '..', 'skills', 'skill-rules.json');
   try {
-    return JSON.parse(readFileSync(rulesPath, 'utf-8'));
+    return JSON.parse(readFileSync(SKILL_RULES_PATH, 'utf-8'));
   } catch {
     return null;
   }
@@ -424,10 +602,16 @@ function findCoveringSkill(
     if (domain.subdomains) {
       for (const [subName, subdomain] of Object.entries(domain.subdomains)) {
         const subMatches =
-          subdomain.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
+          subdomain.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ??
+          false;
 
         if (subMatches && bestSpecificity < 2) {
-          bestMatch = { domain: domainName, subdomain: subName, skillFilePath: subdomain.path, specificity: 2 };
+          bestMatch = {
+            domain: domainName,
+            subdomain: subName,
+            skillFilePath: subdomain.path,
+            specificity: 2,
+          };
           bestSpecificity = 2;
         }
 
@@ -435,10 +619,17 @@ function findCoveringSkill(
         if (subdomain.skills) {
           for (const [skillName, skill] of Object.entries(subdomain.skills)) {
             const skillMatches =
-              skill.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
+              skill.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ??
+              false;
 
             if (skillMatches && bestSpecificity < 3) {
-              bestMatch = { domain: domainName, subdomain: subName, skill: skillName, skillFilePath: skill.path, specificity: 3 };
+              bestMatch = {
+                domain: domainName,
+                subdomain: subName,
+                skill: skillName,
+                skillFilePath: skill.path,
+                specificity: 3,
+              };
               bestSpecificity = 3;
             }
           }
@@ -453,7 +644,12 @@ function findCoveringSkill(
           skill.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
 
         if (skillMatches && bestSpecificity < 2.5) {
-          bestMatch = { domain: domainName, skill: skillName, skillFilePath: skill.path, specificity: 2.5 };
+          bestMatch = {
+            domain: domainName,
+            skill: skillName,
+            skillFilePath: skill.path,
+            specificity: 2.5,
+          };
           bestSpecificity = 2.5;
         }
       }
@@ -474,12 +670,34 @@ function findCoveringSkill(
 function inferDomain(filePath: string, rules: SkillRules | null): string {
   if (rules) {
     for (const [domainName, domain] of Object.entries(rules.domains)) {
-      const matches = domain.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
+      const matches =
+        domain.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
       if (matches) return domainName;
     }
   }
   // Fallback: use first path segment (e.g., "frontend/src/..." → "frontend")
   return filePath.split('/')[0] || 'other';
+}
+
+/**
+ * The directory a new-skill suggestion covers (up to three segments) and its skill name. Named
+ * from the whole path so `apps/web/src` and `packages/ui/src` don't both become `src` and
+ * overwrite each other. Returns null for repo-root files.
+ */
+function newSkillTarget(filePath: string): { dir: string; skillName: string } | null {
+  const parent = dirname(filePath);
+  if (parent === '.') return null;
+  const dir = parent.split('/').slice(0, 3).join('/');
+  return { dir, skillName: dir.replace(/\//g, '-') };
+}
+
+/** Single-quote for bash: names come from repo paths, which a contributor controls. */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+function newSkillPath(domain: string, skillName: string): string {
+  return existsSync(join(SKILLS_DIR, domain, 'SKILL.md')) ? `${domain}/${skillName}` : skillName;
 }
 
 // ============================================================================
@@ -489,10 +707,11 @@ function inferDomain(filePath: string, rules: SkillRules | null): string {
 function generateSuggestions(
   files: FileChange[],
   patterns: PatternDetection[],
-  rules: SkillRules | null
+  rules: SkillRules | null,
+  source: ChangeSource
 ): SkillSuggestion[] {
   const suggestions: SkillSuggestion[] = [];
-  const skillsDir = join(__dirname, '..', 'skills');
+  const skillsDir = SKILLS_DIR;
 
   // Find uncovered files
   const uncoveredFiles: FileChange[] = [];
@@ -527,7 +746,7 @@ function generateSuggestions(
   // than using a blunt line-count threshold.
   if (rules) {
     const baseBranch = rules.config?.baseBranch || 'main';
-    const modifiedSkillFiles = getModifiedSkillFiles(baseBranch);
+    const modifiedSkillFiles = getModifiedSkillFiles(baseBranch, source);
     const changedPaths = new Set(files.map((f) => f.path));
 
     for (const [skillPath, { result }] of coverageBySkillPath) {
@@ -561,19 +780,23 @@ function generateSuggestions(
   if (uncoveredFiles.length >= 3) {
     const byDir = new Map<string, FileChange[]>();
     for (const file of uncoveredFiles) {
-      const parts = file.path.split('/');
-      const relevantDir = parts.slice(0, 3).join('/');
-      if (!byDir.has(relevantDir)) {
-        byDir.set(relevantDir, []);
+      const target = newSkillTarget(file.path);
+      if (!target) continue;
+      if (!byDir.has(target.dir)) {
+        byDir.set(target.dir, []);
       }
-      byDir.get(relevantDir)!.push(file);
+      byDir.get(target.dir)!.push(file);
     }
 
     for (const [dir, dirFiles] of byDir) {
       if (dirFiles.length >= 2) {
-        const skillName = dir.split('/').pop() || 'unknown';
+        const skillName = newSkillTarget(dirFiles[0].path)!.skillName;
         const domain = inferDomain(dir, rules);
-        const skillPath = `${domain}/${skillName}`;
+        const skillPath = newSkillPath(domain, skillName);
+        // Never suggest a scaffold that would overwrite an existing skill.
+        if (existsSync(join(skillsDir, skillPath, 'SKILL.md'))) continue;
+        const quotedDir = shellQuote(`${skillsDir}/${skillPath}`);
+        const quotedFile = shellQuote(`${skillsDir}/${skillPath}/SKILL.md`);
 
         suggestions.push({
           type: 'new',
@@ -581,7 +804,12 @@ function generateSuggestions(
           domain,
           reason: `${dirFiles.length} files changed in ${dir} with no skill coverage`,
           suggestedContent: dirFiles.slice(0, 5).map((f) => f.path),
-          scaffoldCommand: `mkdir -p ${skillsDir}/${skillPath} && cat > ${skillsDir}/${skillPath}/SKILL.md << 'EOF'
+          scaffoldCommand: `mkdir -p ${quotedDir} && cat > ${quotedFile} << 'EOF'
+---
+name: ${skillName}
+description: "[What this covers]. Use when [tasks that should load it]."
+---
+
 # ${skillName.charAt(0).toUpperCase() + skillName.slice(1)} Skill
 
 ## Overview
@@ -626,12 +854,16 @@ EOF`,
 
     // Built-in: significant-directory-change → suggest new skill
     if (pattern.pattern === 'significant-directory-change') {
-      const dir = pattern.files[0]?.split('/').slice(0, 3).join('/');
-      if (dir && !suggestions.some((s) => s.skillName === dir.split('/').pop())) {
+      const target = pattern.files[0] ? newSkillTarget(pattern.files[0]) : null;
+      const domain = target ? inferDomain(target.dir, rules) : '';
+      const exists =
+        target && existsSync(join(SKILLS_DIR, newSkillPath(domain, target.skillName), 'SKILL.md'));
+      if (target && !exists && !suggestions.some((s) => s.skillName === target.skillName)) {
+        const { dir, skillName } = target;
         suggestions.push({
           type: 'new',
-          skillName: dir.split('/').pop() || 'new-feature',
-          domain: inferDomain(dir, rules),
+          skillName,
+          domain,
           reason: pattern.description,
           suggestedContent: [`Major development in ${dir} - consider creating a dedicated skill`],
         });
@@ -650,8 +882,12 @@ EOF`,
           type: 'new',
           skillName: 'new-subsystem',
           domain,
-          reason: `${uncoveredNewFiles.length} significant new file(s) not covered by any skill: ${uncoveredNewFiles.join(', ')}`,
-          suggestedContent: ['Consider creating a skill if these files introduce a new pattern or subsystem'],
+          reason:
+            `${uncoveredNewFiles.length} significant new file(s) not covered by any skill: ` +
+            uncoveredNewFiles.join(', '),
+          suggestedContent: [
+            'Consider creating a skill if these files introduce a new pattern or subsystem',
+          ],
         });
       }
     }
@@ -675,9 +911,11 @@ function formatOutput(
   files: FileChange[],
   patterns: PatternDetection[],
   suggestions: SkillSuggestion[],
+  docSuggestions: DocSuggestion[],
   commitMessages: string[],
   branch: string,
-  rules: SkillRules | null
+  rules: SkillRules | null,
+  source: ChangeSource
 ): string {
   const lines: string[] = [];
 
@@ -689,6 +927,11 @@ function formatOutput(
 
   // Branch context
   lines.push(`\u{1F33F} Branch: ${branch}`);
+  if (source === 'working-tree') {
+    lines.push(
+      '   Source: UNCOMMITTED working tree (nothing committed to compare against the base)'
+    );
+  }
   lines.push('');
 
   // Summary
@@ -751,22 +994,55 @@ function formatOutput(
     if (newSkills.length > 0) {
       lines.push('   \u{2728} CONSIDER NEW SKILLS:');
       for (const s of newSkills) {
-        lines.push(`      \u2192 ${s.domain}/${s.skillName}/SKILL.md`);
+        const skillPath = newSkillPath(s.domain, s.skillName);
+        lines.push(`      \u2192 ${skillPath}/SKILL.md`);
         lines.push(`         Reason: ${s.reason}`);
         if (s.scaffoldCommand) {
           lines.push('');
           lines.push('         \u{1F6E0}\uFE0F  Scaffold command:');
-          lines.push('         ```bash');
-          // Show abbreviated command
-          lines.push(`         mkdir -p .claude/skills/${s.domain}/${s.skillName}`);
-          lines.push(`         # Then create SKILL.md with overview, architecture, patterns`);
-          lines.push('         ```');
+          lines.push('````bash');
+          lines.push(s.scaffoldCommand);
+          lines.push('````');
+          lines.push('         Fill in the description.');
+        }
+        if (skillPath.includes('/')) {
+          lines.push(
+            `         Link it from .claude/skills/${s.domain}/SKILL.md: ` +
+              "nested skills aren't discovered on their own"
+          );
         }
         lines.push('');
       }
     }
   } else {
     lines.push('\u2705 No skill updates suggested - current coverage looks good!');
+    lines.push('');
+  }
+
+  // Package docs
+  if (docSuggestions.length > 0) {
+    lines.push('\u{1F4DA} DOCS TO UPDATE');
+    lines.push('');
+    const byPackage = new Map<string, DocSuggestion[]>();
+    for (const d of docSuggestions) {
+      if (!byPackage.has(d.package)) byPackage.set(d.package, []);
+      byPackage.get(d.package)!.push(d);
+    }
+    for (const [pkg, docs] of byPackage) {
+      lines.push(`   \u{1F4E6} ${pkg}`);
+      for (const d of docs) {
+        lines.push(`      → ${d.docPath}${d.exists ? '' : '  (MISSING — create it)'}`);
+        lines.push(`         Covers: ${d.description}`);
+        const fileList = d.triggeringFiles.slice(0, 3).join(', ');
+        const extra = d.triggeringFiles.length - 3;
+        lines.push(`         Changed: ${fileList}${extra > 0 ? ` (+${extra} more)` : ''}`);
+        lines.push('');
+      }
+    }
+    lines.push("   Describe what changed for the doc's readers, not how the code moved around.");
+    lines.push('');
+  } else if (rules?.docs?.length) {
+    lines.push('✅ Docs look current for these changes.');
     lines.push('');
   }
 
@@ -781,8 +1057,12 @@ function formatOutput(
 
   lines.push('\u2501'.repeat(65));
   lines.push('\u{1F449} Review suggestions above');
-  lines.push('   Skills should evolve with your codebase - update them in this PR!');
-  lines.push('   Run /check-skills anytime to re-analyze');
+  lines.push(
+    rules?.docs?.length
+      ? '   Skills and docs should evolve with your codebase - update them in this PR!'
+      : '   Skills should evolve with your codebase - update them in this PR!',
+  );
+  lines.push('   Run /thoth:check-skills anytime to re-analyze');
   lines.push('\u2501'.repeat(65));
   lines.push('');
 
@@ -796,14 +1076,24 @@ function formatOutput(
 async function main() {
   const rules = loadSkillRules();
   const baseBranch = rules?.config?.baseBranch || 'main';
-  const files = getChangedFiles(baseBranch);
+  const { files, source } = getChangedFiles(baseBranch);
   const commitMessages = getRecentCommitMessages();
   const branch = getCurrentBranch();
 
   const patterns = detectPatterns(files, rules?.globalPatterns, rules?.config?.evolutionPatterns);
-  const suggestions = generateSuggestions(files, patterns, rules);
+  const suggestions = generateSuggestions(files, patterns, rules, source);
+  const docSuggestions = detectStaleDocs(files, rules, source);
 
-  const output = formatOutput(files, patterns, suggestions, commitMessages, branch, rules);
+  const output = formatOutput(
+    files,
+    patterns,
+    suggestions,
+    docSuggestions,
+    commitMessages,
+    branch,
+    rules,
+    source
+  );
   process.stdout.write(output);
 
   process.exit(0);

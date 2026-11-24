@@ -1,0 +1,9 @@
+{
+  "name": "thoth",
+  "description": "Suggests repo skills, keeps them current, and reviews each PR before it opens.",
+  "author": {
+    "name": "Maestro"
+  },
+  "repository": "https://github.com/lessthan3/thoth",
+  "license": "MIT"
+}

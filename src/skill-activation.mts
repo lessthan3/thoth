@@ -14,7 +14,13 @@
 import { readFileSync, appendFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
+import {
+  PROJECT_DIR,
+  SKILL_RULES_PATH,
+  hasSkillRules,
+  useProjectFrom,
+} from './project.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -83,9 +89,8 @@ interface MatchResult {
 // ============================================================================
 
 function loadSkillRules(): SkillRules {
-  const rulesPath = join(__dirname, '..', 'skills', 'skill-rules.json');
   try {
-    const content = readFileSync(rulesPath, 'utf-8');
+    const content = readFileSync(SKILL_RULES_PATH, 'utf-8');
     return JSON.parse(content);
   } catch (error) {
     console.error(`Failed to load skill rules: ${error}`);
@@ -125,7 +130,8 @@ function checkPromptTriggers(prompt: string, triggers?: PromptTriggers): string[
       const excluded =
         triggers.excludeKeywords && matchesKeywords(prompt, triggers.excludeKeywords).length > 0;
       if (!excluded) {
-        matched.push(`keywords: ${keywordMatches.slice(0, 3).join(', ')}${keywordMatches.length > 3 ? '...' : ''}`);
+        const more = keywordMatches.length > 3 ? '...' : '';
+        matched.push(`keywords: ${keywordMatches.slice(0, 3).join(', ')}${more}`);
       }
     }
   }
@@ -285,9 +291,10 @@ function log(message: string): void {
 
 function runSkillEvolution(): string {
   try {
-    const output = execSync('npx --yes tsx skill-evolution.ts', {
+    const script = join(__dirname, 'skill-evolution.mjs');
+    const output = execFileSync(process.execPath, [script], {
       encoding: 'utf-8',
-      cwd: __dirname,
+      cwd: PROJECT_DIR,
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: 30000,
     });
@@ -347,7 +354,11 @@ function formatOutput(matches: MatchResult[]): string {
 
     for (const match of group) {
       const levelIndicator =
-        match.level === 'skill' ? '\u{1F4C4}' : match.level === 'subdomain' ? '\u{1F4C1}' : '\u{1F4E6}';
+        match.level === 'skill'
+          ? '\u{1F4C4}'
+          : match.level === 'subdomain'
+            ? '\u{1F4C1}'
+            : '\u{1F4E6}';
 
       lines.push(`   ${levelIndicator} ${match.name}`);
       lines.push(`      ${match.description}`);
@@ -387,6 +398,14 @@ async function main() {
 
   const prompt = input.prompt || '';
   if (!prompt.trim()) {
+    process.exit(0);
+  }
+
+  useProjectFrom(input.cwd);
+
+  // Thoth is installed for every repository, but only repositories with a skill-rules.json have
+  // skills to suggest. Stay silent everywhere else.
+  if (!hasSkillRules()) {
     process.exit(0);
   }
 
