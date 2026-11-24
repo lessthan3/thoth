@@ -14,8 +14,9 @@
 
 import { hasSkillRules, useProjectFrom } from './project.mjs';
 
-// `-R/--repo` is a `gh pr` option, so it can sit between `pr` and `create`.
-const PR_CREATE = /\bgh\s+pr(?:\s+(?:-R|--repo)(?:=|\s+)\S+)*\s+(create|new)\b/;
+// gh accepts `-R/--repo` both before and after `pr`: `gh -R o/r pr create`, `gh pr -R o/r create`.
+const REPO_OPT = String.raw`(?:\s+(?:-R|--repo)(?:=|\s+)\S+)*`;
+const PR_CREATE = new RegExp(String.raw`\bgh${REPO_OPT}\s+pr${REPO_OPT}\s+(create|new)\b`);
 const MARKER = 'pre-pr-checks-done';
 // Only the documented trailing bash comment counts, not the word inside a title or body.
 const MARKER_COMMENT = new RegExp(`(^|\\s)#\\s*${MARKER}\\s*$`);

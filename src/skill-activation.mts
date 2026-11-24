@@ -130,7 +130,8 @@ function checkPromptTriggers(prompt: string, triggers?: PromptTriggers): string[
       const excluded =
         triggers.excludeKeywords && matchesKeywords(prompt, triggers.excludeKeywords).length > 0;
       if (!excluded) {
-        matched.push(`keywords: ${keywordMatches.slice(0, 3).join(', ')}${keywordMatches.length > 3 ? '...' : ''}`);
+        const more = keywordMatches.length > 3 ? '...' : '';
+        matched.push(`keywords: ${keywordMatches.slice(0, 3).join(', ')}${more}`);
       }
     }
   }
@@ -353,7 +354,11 @@ function formatOutput(matches: MatchResult[]): string {
 
     for (const match of group) {
       const levelIndicator =
-        match.level === 'skill' ? '\u{1F4C4}' : match.level === 'subdomain' ? '\u{1F4C1}' : '\u{1F4E6}';
+        match.level === 'skill'
+          ? '\u{1F4C4}'
+          : match.level === 'subdomain'
+            ? '\u{1F4C1}'
+            : '\u{1F4E6}';
 
       lines.push(`   ${levelIndicator} ${match.name}`);
       lines.push(`      ${match.description}`);

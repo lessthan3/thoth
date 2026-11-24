@@ -18,7 +18,7 @@
 
 import { existsSync, readFileSync, statSync } from 'fs';
 import { join, dirname } from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { PROJECT_DIR, SKILLS_DIR, SKILL_RULES_PATH } from './project.mjs';
 
 // ============================================================================
@@ -153,7 +153,51 @@ function parseNumstat(output: string): FileChange[] {
         isNew: deletions === '0' || parseInt(deletions) === 0,
       };
     })
-    .filter((f) => f.path && !f.path.startsWith('.claude/')); // Exclude .claude changes from analysis
+    // Exclude .claude changes from analysis
+    .filter((f) => f.path && !f.path.startsWith('.claude/'));
+}
+
+/**
+ * Runs git with an argument list, never a shell: refs come from skill-rules.json and env vars,
+ * which a cloned repository controls. Returns null when git fails (usually an unknown ref).
+ */
+function git(args: string[]): string | null {
+  try {
+    return execFileSync('git', args, {
+      encoding: 'utf-8',
+      cwd: PROJECT_DIR,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    return null;
+  }
+}
+
+const branchPoints = new Map<string, string | null>();
+
+/**
+ * The commit this branch forked from: the merge-base of HEAD and the first base ref that
+ * resolves (`origin/<base>`, then `<base>`). The base comes from GITHUB_BASE_REF, BASE_BRANCH or
+ * config.baseBranch; anything that isn't a valid branch name (including `-option` lookalikes) is
+ * ignored. Null when no base resolves, e.g. a shallow CI clone or no remote.
+ */
+function branchPoint(baseBranch: string): string | null {
+  const target = process.env.GITHUB_BASE_REF || process.env.BASE_BRANCH || baseBranch;
+  if (branchPoints.has(target)) return branchPoints.get(target)!;
+
+  let point: string | null = null;
+  if (git(['check-ref-format', '--branch', target]) !== null) {
+    for (const ref of [`refs/remotes/origin/${target}`, `refs/heads/${target}`]) {
+      point = git(['merge-base', ref, 'HEAD'])?.trim() || null;
+      if (point) break;
+    }
+  }
+  branchPoints.set(target, point);
+  return point;
+}
+
+function splitLines(output: string | null): string[] {
+  return (output ?? '').trim().split('\n').filter(Boolean);
 }
 
 /**
@@ -162,169 +206,79 @@ function parseNumstat(output: string): FileChange[] {
  * the user's index.
  */
 function getUntrackedFiles(projectDir: string): FileChange[] {
-  try {
-    const output = execSync('git ls-files --others --exclude-standard', {
-      encoding: 'utf-8',
-      cwd: projectDir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    return output
-      .trim()
-      .split('\n')
-      .filter((p) => p.trim() && !p.startsWith('.claude/'))
-      .map((p) => {
-        let additions = 0;
-        try {
-          const full = join(projectDir, p);
-          if (statSync(full).size <= 1_000_000) {
-            const text = readFileSync(full, 'utf-8');
-            // Count lines like git: a trailing newline doesn't start a new line.
-            additions = text.split('\n').length - (text === '' || text.endsWith('\n') ? 1 : 0);
-          }
-        } catch {
-          // Unreadable: still worth reporting as a new file.
+  return splitLines(git(['ls-files', '--others', '--exclude-standard']))
+    .filter((p) => !p.startsWith('.claude/'))
+    .map((p) => {
+      let additions = 0;
+      try {
+        const full = join(projectDir, p);
+        if (statSync(full).size <= 1_000_000) {
+          const text = readFileSync(full, 'utf-8');
+          // Count lines like git: a trailing newline doesn't start a new line.
+          additions = text.split('\n').length - (text === '' || text.endsWith('\n') ? 1 : 0);
         }
-        return { path: p, additions, deletions: 0, isNew: true };
-      });
-  } catch {
-    return [];
-  }
+      } catch {
+        // Unreadable: still worth reporting as a new file.
+      }
+      return { path: p, additions, deletions: 0, isNew: true };
+    });
 }
 
 function getChangedFiles(baseBranch = 'main'): { files: FileChange[]; source: ChangeSource } {
   const projectDir = PROJECT_DIR;
+  const point = branchPoint(baseBranch);
 
-  // Allow CI to override the target branch
-  const target = process.env.GITHUB_BASE_REF || process.env.BASE_BRANCH || baseBranch;
-
-  const run = (cmd: string): string | null => {
-    try {
-      return execSync(cmd, { encoding: 'utf-8', cwd: projectDir, stdio: ['pipe', 'pipe', 'pipe'] });
-    } catch {
-      return null; // Command failed — usually an unresolvable ref.
+  if (point) {
+    // A base-relative diff is authoritative: if the base resolves, its answer
+    // stands even when empty (branch is level with its base). Decide on the raw
+    // diff, before parseNumstat drops `.claude/` paths: a branch that only
+    // commits skill edits still has committed work.
+    const committed = git(['diff', '--numstat', point, 'HEAD']);
+    if (committed?.trim()) {
+      // Analyze the branch as it stands, uncommitted edits included, so a skill
+      // or doc Claude just updated counts as updated before it's committed.
+      const files = parseNumstat(git(['diff', '--numstat', point]) ?? committed);
+      return { files: files.concat(getUntrackedFiles(projectDir)), source: 'committed' };
     }
-  };
-
-  try {
-    // A base-relative diff is authoritative: if the base ref resolves, its
-    // answer stands even when empty (branch is level with its base). Only when
-    // neither resolves — shallow CI clone, no remote — do we guess from HEAD.
-    let output: string | null = null;
-    for (const cmd of [
-      `git diff --numstat origin/${target}...HEAD`,
-      `git diff --numstat ${target}...HEAD`,
-    ]) {
-      output = run(cmd);
-      if (output !== null) break;
-    }
-
-    if (output === null) {
-      for (const cmd of [
-        `git diff --numstat HEAD~1...HEAD`,
-        `git show --numstat --format="" HEAD`,
-      ]) {
-        output = run(cmd);
-        if (output?.trim()) break;
-      }
-    }
-
-    // Decide on the raw diff, before parseNumstat drops `.claude/` paths: a
-    // branch that only commits skill edits still has committed work.
-    if (output?.trim()) return { files: parseNumstat(output), source: 'committed' };
-
-    // Nothing committed to analyze — fall back to the working tree so an
-    // in-progress change doesn't report a clean bill of health.
-    let working: FileChange[] = [];
-    try {
-      const output = execSync('git diff --numstat HEAD', {
-        encoding: 'utf-8',
-        cwd: projectDir,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      working = parseNumstat(output);
-    } catch {
-      // No HEAD yet (fresh repo) — untracked files below still apply.
-    }
-    working = working.concat(getUntrackedFiles(projectDir));
-
-    return working.length > 0
-      ? { files: working, source: 'working-tree' }
-      : { files: [], source: 'committed' };
-  } catch {
-    return { files: [], source: 'committed' };
+  } else {
+    // No base to compare against: guess from the last commit.
+    const last =
+      git(['diff', '--numstat', 'HEAD~1', 'HEAD']) ??
+      git(['show', '--numstat', '--format=', 'HEAD']);
+    if (last?.trim()) return { files: parseNumstat(last), source: 'committed' };
   }
+
+  // Nothing committed to analyze — fall back to the working tree so an
+  // in-progress change doesn't report a clean bill of health. Without a HEAD
+  // (fresh repo) the diff fails and only untracked files apply.
+  const working = parseNumstat(git(['diff', '--numstat', 'HEAD']) ?? '').concat(
+    getUntrackedFiles(projectDir)
+  );
+  return working.length > 0
+    ? { files: working, source: 'working-tree' }
+    : { files: [], source: 'committed' };
 }
 
 function getRecentCommitMessages(count = 10): string[] {
-  const projectDir = PROJECT_DIR;
-
-  try {
-    const output = execSync(`git log --oneline -${count}`, {
-      encoding: 'utf-8',
-      cwd: projectDir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    return output.trim().split('\n').filter(Boolean);
-  } catch {
-    return [];
-  }
+  return splitLines(git(['log', '--oneline', `-${count}`]));
 }
 
 function getCurrentBranch(): string {
-  const projectDir = PROJECT_DIR;
-
-  try {
-    return execSync('git branch --show-current', {
-      encoding: 'utf-8',
-      cwd: projectDir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
-  } catch {
-    return 'unknown';
-  }
+  return git(['branch', '--show-current'])?.trim() || 'unknown';
 }
 
-function getModifiedSkillFiles(baseBranch = 'main', source: ChangeSource = 'committed'): Set<string> {
-  const projectDir = PROJECT_DIR;
-  const target = process.env.GITHUB_BASE_REF || process.env.BASE_BRANCH || baseBranch;
-
-  try {
-    const commands =
-      source === 'working-tree'
-        ? [
-            `git diff --name-only HEAD -- .claude/skills/`,
-            `git ls-files --others --exclude-standard -- .claude/skills/`,
-          ]
-        : [
-            `git diff --name-only origin/${target}...HEAD -- .claude/skills/`,
-            `git diff --name-only ${target}...HEAD -- .claude/skills/`,
-          ];
-
-    // Working-tree mode unions modified and untracked skills. Committed mode
-    // stops at the first base ref that resolves: a stale local base would
-    // count upstream skill edits as changes made in this branch.
-    const modified = new Set<string>();
-    for (const cmd of commands) {
-      try {
-        const output = execSync(cmd, {
-          encoding: 'utf-8',
-          cwd: projectDir,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-        for (const p of output.trim().split('\n').filter(Boolean)) {
-          modified.add(p.replace(/^\.claude\/skills\//, ''));
-        }
-        if (source === 'committed') break;
-      } catch {
-        continue;
-      }
-    }
-    return modified;
-  } catch {
-    // ignore
-  }
-  return new Set();
+/**
+ * Skill files already edited on this branch, committed or not, relative to `.claude/skills/`.
+ * Diffing against the branch point (not a possibly stale local base) keeps upstream skill edits
+ * from counting as this branch's.
+ */
+function getModifiedSkillFiles(baseBranch = 'main', source: ChangeSource = 'committed') {
+  const point = source === 'committed' ? branchPoint(baseBranch) : null;
+  const paths = [
+    ...splitLines(git(['diff', '--name-only', point ?? 'HEAD', '--', '.claude/skills/'])),
+    ...splitLines(git(['ls-files', '--others', '--exclude-standard', '--', '.claude/skills/'])),
+  ];
+  return new Set(paths.map((p) => p.replace(/^\.claude\/skills\//, '')));
 }
 
 /**
@@ -369,10 +323,14 @@ function getSkillReferencedPaths(skillRelativePath: string): Set<string> {
  * something the docs may need to describe.
  */
 function diffTouchesPublicApi(diff: string, publicApi: RegExp): boolean {
-  return diff
-    .split('\n')
-    .filter((l) => (l.startsWith('+') || l.startsWith('-')) && !l.startsWith('+++') && !l.startsWith('---'))
-    .some((l) => publicApi.test(l.slice(1)));
+  // Only read hunk bodies: a removed `-- comment` line looks like a `---` header.
+  let inHunk = false;
+  return diff.split('\n').some((l) => {
+    if (l.startsWith('@@')) inHunk = true;
+    else if (l.startsWith('diff --git')) inHunk = false;
+    else if (inHunk && (l.startsWith('+') || l.startsWith('-'))) return publicApi.test(l.slice(1));
+    return false;
+  });
 }
 
 function touchesPublicApi(
@@ -381,51 +339,30 @@ function touchesPublicApi(
   source: ChangeSource,
   publicApi: RegExp,
 ): boolean {
-  const projectDir = PROJECT_DIR;
-  const target = process.env.GITHUB_BASE_REF || process.env.BASE_BRANCH || baseBranch;
-  const quoted = `'${filePath.replace(/'/g, `'\\''`)}'`;
+  const point = source === 'committed' ? branchPoint(baseBranch) : null;
+  const diffs: string[][] =
+    source === 'working-tree' || point
+      ? [['diff', '-U0', point ?? 'HEAD', '--', filePath]]
+      : [
+          ['diff', '-U0', 'HEAD~1', 'HEAD', '--', filePath],
+          ['show', '-U0', '--format=', 'HEAD', '--', filePath],
+        ];
 
-  if (source === 'working-tree') {
-    try {
-      const output = execSync(`git diff -U0 HEAD -- ${quoted}`, {
-        encoding: 'utf-8',
-        cwd: projectDir,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      if (output.trim()) return diffTouchesPublicApi(output, publicApi);
-    } catch {
-      // Fall through to the untracked-file check.
-    }
-    // Untracked: no diff to read, so judge the whole file.
-    try {
-      const content = readFileSync(join(projectDir, filePath), 'utf-8');
-      return content.split('\n').some((l) => publicApi.test(l));
-    } catch {
-      return false;
-    }
+  for (const args of diffs) {
+    const output = git(args);
+    if (output?.trim()) return diffTouchesPublicApi(output, publicApi);
   }
 
-  const commands = [
-    `git diff -U0 origin/${target}...HEAD -- ${quoted}`,
-    `git diff -U0 ${target}...HEAD -- ${quoted}`,
-    `git diff -U0 HEAD~1...HEAD -- ${quoted}`,
-    `git show -U0 --format="" HEAD -- ${quoted}`,
-  ];
-
-  for (const cmd of commands) {
-    try {
-      const output = execSync(cmd, {
-        encoding: 'utf-8',
-        cwd: projectDir,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      if (!output.trim()) continue;
-      return diffTouchesPublicApi(output, publicApi);
-    } catch {
-      continue;
-    }
+  // Untracked: no diff to read, so judge the whole file.
+  if (!splitLines(git(['ls-files', '--others', '--exclude-standard', '--', filePath])).length) {
+    return false;
   }
-  return false;
+  try {
+    const content = readFileSync(join(PROJECT_DIR, filePath), 'utf-8');
+    return content.split('\n').some((l) => publicApi.test(l));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -495,15 +432,29 @@ function detectStaleDocs(
 
 function matchesGlobPattern(filePath: string, pattern: string): boolean {
   try {
-    // Escape regex metacharacters (e.g. Next.js `app/(marketing)/**`), then translate globs:
-    // `**/` is zero or more directories, `**` anything, `*` anything within one segment.
-    const regexPattern = pattern
-      .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*\*\//g, '\u0000')
-      .replace(/\*\*/g, '\u0001')
-      .replace(/\*/g, '[^/]*')
-      .replace(/\u0000/g, '(?:.*/)?')
-      .replace(/\u0001/g, '.*');
+    // `**/` is zero or more directories, `**` anything, `*` anything within one segment, `?` one
+    // character, `{a,b}` either. Everything else is literal (e.g. Next.js `app/(marketing)/**`).
+    let regexPattern = '';
+    let braces = 0;
+    for (let i = 0; i < pattern.length; i++) {
+      const c = pattern[i];
+      if (pattern.startsWith('**/', i)) {
+        regexPattern += '(?:.*/)?';
+        i += 2;
+      } else if (pattern.startsWith('**', i)) {
+        regexPattern += '.*';
+        i += 1;
+      } else if (c === '*') regexPattern += '[^/]*';
+      else if (c === '?') regexPattern += '[^/]';
+      else if (c === '{') {
+        braces++;
+        regexPattern += '(?:';
+      } else if (c === '}' && braces > 0) {
+        braces--;
+        regexPattern += ')';
+      } else if (c === ',' && braces > 0) regexPattern += '|';
+      else regexPattern += c.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+    }
 
     return new RegExp(`^${regexPattern}$`).test(filePath);
   } catch {
@@ -541,7 +492,9 @@ function detectPatterns(
       patterns.push({
         pattern: 'significant-directory-change',
         files: files.filter((f) => dirname(f.path) === dir).map((f) => f.path),
-        description: `High velocity change in ${dir}: ${stats.count} files, ${stats.additions} lines added`,
+        description:
+          `High velocity change in ${dir}: ${stats.count} files, ` +
+          `${stats.additions} lines added`,
       });
     }
   });
@@ -590,7 +543,11 @@ function detectPatterns(
       const matchingFiles = files.filter((f) => {
         return gp.rules.some((rule) => {
           const pathMatches = matchesGlobPattern(f.path, rule.path);
-          const typeMatches = !rule.type || rule.type === 'any' || (rule.type === 'new' && f.isNew) || (rule.type === 'modified' && !f.isNew);
+          const typeMatches =
+            !rule.type ||
+            rule.type === 'any' ||
+            (rule.type === 'new' && f.isNew) ||
+            (rule.type === 'modified' && !f.isNew);
           return pathMatches && typeMatches;
         });
       });
@@ -645,10 +602,16 @@ function findCoveringSkill(
     if (domain.subdomains) {
       for (const [subName, subdomain] of Object.entries(domain.subdomains)) {
         const subMatches =
-          subdomain.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
+          subdomain.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ??
+          false;
 
         if (subMatches && bestSpecificity < 2) {
-          bestMatch = { domain: domainName, subdomain: subName, skillFilePath: subdomain.path, specificity: 2 };
+          bestMatch = {
+            domain: domainName,
+            subdomain: subName,
+            skillFilePath: subdomain.path,
+            specificity: 2,
+          };
           bestSpecificity = 2;
         }
 
@@ -656,10 +619,17 @@ function findCoveringSkill(
         if (subdomain.skills) {
           for (const [skillName, skill] of Object.entries(subdomain.skills)) {
             const skillMatches =
-              skill.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
+              skill.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ??
+              false;
 
             if (skillMatches && bestSpecificity < 3) {
-              bestMatch = { domain: domainName, subdomain: subName, skill: skillName, skillFilePath: skill.path, specificity: 3 };
+              bestMatch = {
+                domain: domainName,
+                subdomain: subName,
+                skill: skillName,
+                skillFilePath: skill.path,
+                specificity: 3,
+              };
               bestSpecificity = 3;
             }
           }
@@ -674,7 +644,12 @@ function findCoveringSkill(
           skill.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
 
         if (skillMatches && bestSpecificity < 2.5) {
-          bestMatch = { domain: domainName, skill: skillName, skillFilePath: skill.path, specificity: 2.5 };
+          bestMatch = {
+            domain: domainName,
+            skill: skillName,
+            skillFilePath: skill.path,
+            specificity: 2.5,
+          };
           bestSpecificity = 2.5;
         }
       }
@@ -695,7 +670,8 @@ function findCoveringSkill(
 function inferDomain(filePath: string, rules: SkillRules | null): string {
   if (rules) {
     for (const [domainName, domain] of Object.entries(rules.domains)) {
-      const matches = domain.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
+      const matches =
+        domain.fileTriggers?.pathPatterns?.some((p) => matchesGlobPattern(filePath, p)) ?? false;
       if (matches) return domainName;
     }
   }
@@ -906,8 +882,12 @@ EOF`,
           type: 'new',
           skillName: 'new-subsystem',
           domain,
-          reason: `${uncoveredNewFiles.length} significant new file(s) not covered by any skill: ${uncoveredNewFiles.join(', ')}`,
-          suggestedContent: ['Consider creating a skill if these files introduce a new pattern or subsystem'],
+          reason:
+            `${uncoveredNewFiles.length} significant new file(s) not covered by any skill: ` +
+            uncoveredNewFiles.join(', '),
+          suggestedContent: [
+            'Consider creating a skill if these files introduce a new pattern or subsystem',
+          ],
         });
       }
     }
@@ -948,7 +928,9 @@ function formatOutput(
   // Branch context
   lines.push(`\u{1F33F} Branch: ${branch}`);
   if (source === 'working-tree') {
-    lines.push('   Source: UNCOMMITTED working tree (nothing committed to compare against the base)');
+    lines.push(
+      '   Source: UNCOMMITTED working tree (nothing committed to compare against the base)'
+    );
   }
   lines.push('');
 
@@ -1024,7 +1006,10 @@ function formatOutput(
           lines.push('         Fill in the description.');
         }
         if (skillPath.includes('/')) {
-          lines.push(`         Link it from .claude/skills/${s.domain}/SKILL.md: nested skills aren't discovered on their own`);
+          lines.push(
+            `         Link it from .claude/skills/${s.domain}/SKILL.md: ` +
+              "nested skills aren't discovered on their own"
+          );
         }
         lines.push('');
       }
@@ -1049,7 +1034,8 @@ function formatOutput(
         lines.push(`      → ${d.docPath}${d.exists ? '' : '  (MISSING — create it)'}`);
         lines.push(`         Covers: ${d.description}`);
         const fileList = d.triggeringFiles.slice(0, 3).join(', ');
-        lines.push(`         Changed: ${fileList}${d.triggeringFiles.length > 3 ? ` (+${d.triggeringFiles.length - 3} more)` : ''}`);
+        const extra = d.triggeringFiles.length - 3;
+        lines.push(`         Changed: ${fileList}${extra > 0 ? ` (+${extra} more)` : ''}`);
         lines.push('');
       }
     }
@@ -1098,7 +1084,16 @@ async function main() {
   const suggestions = generateSuggestions(files, patterns, rules, source);
   const docSuggestions = detectStaleDocs(files, rules, source);
 
-  const output = formatOutput(files, patterns, suggestions, docSuggestions, commitMessages, branch, rules, source);
+  const output = formatOutput(
+    files,
+    patterns,
+    suggestions,
+    docSuggestions,
+    commitMessages,
+    branch,
+    rules,
+    source
+  );
   process.stdout.write(output);
 
   process.exit(0);

@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "if": "Bash(gh pr *)",
+            "if": "Bash(gh *)",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/pre-pr-check.mjs\"",
             "onFailure": "block"
           }

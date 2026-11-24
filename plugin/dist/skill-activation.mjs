@@ -58,7 +58,8 @@ function checkPromptTriggers(prompt, triggers) {
             // Check if any exclude keywords are present — if so, suppress all keyword matches
             const excluded = triggers.excludeKeywords && matchesKeywords(prompt, triggers.excludeKeywords).length > 0;
             if (!excluded) {
-                matched.push(`keywords: ${keywordMatches.slice(0, 3).join(', ')}${keywordMatches.length > 3 ? '...' : ''}`);
+                const more = keywordMatches.length > 3 ? '...' : '';
+                matched.push(`keywords: ${keywordMatches.slice(0, 3).join(', ')}${more}`);
             }
         }
     }
@@ -252,7 +253,11 @@ function formatOutput(matches) {
         lines.push(`${PRIORITY_EMOJI[priority]} ${PRIORITY_LABEL[priority]}:`);
         lines.push('');
         for (const match of group) {
-            const levelIndicator = match.level === 'skill' ? '\u{1F4C4}' : match.level === 'subdomain' ? '\u{1F4C1}' : '\u{1F4E6}';
+            const levelIndicator = match.level === 'skill'
+                ? '\u{1F4C4}'
+                : match.level === 'subdomain'
+                    ? '\u{1F4C1}'
+                    : '\u{1F4E6}';
             lines.push(`   ${levelIndicator} ${match.name}`);
             lines.push(`      ${match.description}`);
             lines.push(`      \u2192 Read: ${match.path}`);
