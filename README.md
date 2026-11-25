@@ -7,7 +7,7 @@ gotchas), keeps that knowledge in sync as the code evolves, and reviews every PR
 ## What It Does
 
 **Skill Activation**: when you prompt Claude, Thoth matches the prompt against the repository's
-skill rules (keywords, intent patterns, file paths) and points Claude at the right skill files.
+skill rules (keywords and intent patterns) and points Claude at the right skill files.
 
 **Skill Evolution**: `/thoth:check-skills` analyzes the branch's changes and suggests skill
 updates, new skills, and doc updates, so documentation keeps up with the code.
@@ -68,6 +68,7 @@ skill files and commit `.claude/skills/`.
   "version": "3.0",
   "config": {
     "baseBranch": "main",
+    "defaultPriority": "high",
     "evolutionPatterns": [
       {
         "name": "api-changes",
@@ -105,18 +106,23 @@ skill files and commit `.claude/skills/`.
 **Domains** are top-level groupings (e.g. `backend`, `frontend`, `infrastructure`). Each has:
 - `path`: the skill file to load, relative to `.claude/skills/`
 - `promptTriggers.keywords`: words that activate it
-- `promptTriggers.excludeKeywords`: words that suppress a prompt match
+- `promptTriggers.excludeKeywords`: words that cancel keyword matches (intent patterns
+  still apply)
 - `promptTriggers.intentPatterns`: regex patterns for intent matching
-- `fileTriggers.pathPatterns`: glob patterns for file-based matching (`*`, `**`, `?`, `{a,b}`)
+- `fileTriggers.pathPatterns`: glob patterns (`*`, `**`, `?`, `{a,b}`) for the files
+  the skill covers, used by `/thoth:check-skills`
 - `priority`: `critical`, `high`, `medium` or `low`; orders suggestions. Defaults to
-  `config.defaultPriority`.
+  `config.defaultPriority`, which is required: without it, matches without a `priority` are
+  silently dropped.
 - `skills`: specific skills within the domain
 - `subdomains`: nested domains (e.g. `frontend/studio`)
 
-Skills and subdomains match on their own triggers, even when their parent domain doesn't.
+Skills and subdomains match prompts on their own triggers, even when their parent domain doesn't.
+For file coverage in `/thoth:check-skills`, the domain's `pathPatterns` must also match.
 
 `config.baseBranch` is the branch `/thoth:check-skills` and `/thoth:self-review` diff against.
-`GITHUB_BASE_REF` or `BASE_BRANCH` in the environment overrides it for `/thoth:check-skills`.
+`GITHUB_BASE_REF` or `BASE_BRANCH` in the environment overrides it for `/thoth:check-skills`;
+an argument to `/thoth:self-review` overrides it there.
 
 **Evolution patterns** in `config.evolutionPatterns` flag kinds of change worth a skill update:
 
