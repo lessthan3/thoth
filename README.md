@@ -49,7 +49,8 @@ claude plugin marketplace add lessthan3/thoth
 claude plugin install thoth@thoth
 ```
 
-Or inside Claude Code: `/plugin install thoth --marketplace lessthan3/thoth`.
+Or inside Claude Code: `/plugin marketplace add lessthan3/thoth`, then
+`/plugin install thoth@thoth`.
 
 ## Set Up a Repository
 
@@ -104,10 +105,18 @@ skill files and commit `.claude/skills/`.
 **Domains** are top-level groupings (e.g. `backend`, `frontend`, `infrastructure`). Each has:
 - `path`: the skill file to load, relative to `.claude/skills/`
 - `promptTriggers.keywords`: words that activate it
+- `promptTriggers.excludeKeywords`: words that suppress a prompt match
 - `promptTriggers.intentPatterns`: regex patterns for intent matching
 - `fileTriggers.pathPatterns`: glob patterns for file-based matching (`*`, `**`, `?`, `{a,b}`)
+- `priority`: `critical`, `high`, `medium` or `low`; orders suggestions. Defaults to
+  `config.defaultPriority`.
 - `skills`: specific skills within the domain
 - `subdomains`: nested domains (e.g. `frontend/studio`)
+
+Skills and subdomains match on their own triggers, even when their parent domain doesn't.
+
+`config.baseBranch` is the branch `/thoth:check-skills` and `/thoth:self-review` diff against.
+`GITHUB_BASE_REF` or `BASE_BRANCH` in the environment overrides it for `/thoth:check-skills`.
 
 **Evolution patterns** in `config.evolutionPatterns` flag kinds of change worth a skill update:
 
@@ -120,8 +129,8 @@ skill files and commit `.claude/skills/`.
 | `minFiles` | No | Minimum files to trigger (default: 1) |
 | `suggestSkill` | No | Skill to suggest updating |
 
-Two patterns are always active: **significant-directory-change** (3+ files and 100+ lines in one
-directory) and **significant-new-files** (new files with 50+ lines).
+Two patterns are always active: **significant-directory-change** (3+ files and more than 100
+added lines in one directory) and **significant-new-files** (new files with 50+ lines).
 
 ### Optional: keep docs in step with code
 
