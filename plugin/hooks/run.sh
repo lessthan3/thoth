@@ -18,15 +18,19 @@ if [ "$hook" = "session-start" ]; then
   exit 0
 fi
 
-# gh, then pr, then create or new, as words; -R/--repo options may sit in between.
-w='[^[:alnum:]_-]'
-args='([^"]*[[:space:]])?'
-pr_create="(^|$w)gh[[:space:]]${args}pr[[:space:]]${args}(create|new)($w|\$)"
+[ "$hook" = "pre-pr-check" ] || exit 0
 
-if [ "$hook" = "pre-pr-check" ] && grep -Eq "$pr_create"; then
+# The Bash command from the hook's JSON input (tool_input.command), still JSON-escaped. Matching
+# only this field keeps a tool description that mentions gh pr create from triggering the block.
+command=$(tr '\n' ' ' | sed -nE 's/.*"command"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)".*/\1/p')
+
+# The Node gate's pattern: gh, pr, then create or new, with only -R/--repo options in between.
+w='[^[:alnum:]_-]'
+repo_opt='([[:space:]]+(-R|--repo)(=|[[:space:]]+)[^[:space:]]+)*'
+pr_create="(^|$w)gh${repo_opt}[[:space:]]+pr${repo_opt}[[:space:]]+(create|new)($w|\$)"
+
+if printf '%s\n' "$command" | grep -Eq "$pr_create"; then
   echo "Thoth needs Node.js 18 or later to run its pre-PR checks, and node isn't on the PATH." >&2
   echo "Ask the user to install Node (https://nodejs.org), then retry." >&2
   exit 2
 fi
-
-exit 0
