@@ -20,6 +20,9 @@ Run it from the repository root:
 node "${CLAUDE_PLUGIN_ROOT}/dist/skill-evolution.mjs"
 ```
 
+If it fails with `node: command not found`, tell the user Thoth needs Node.js 18 or later
+(https://nodejs.org) and stop.
+
 It reports:
 1. What files have changed in this branch
 2. What patterns were detected (new components, API changes, etc.)
