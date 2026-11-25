@@ -219,5 +219,6 @@ installs with auto-update pick it up at their next check.
 ## Requirements
 
 - Claude Code 2.1.295 or later (the gate uses `onFailure: "block"`)
-- Node.js 18 or later on the `PATH`
+- Node.js 18 or later on the `PATH`. Without it, each session starts with a message to install
+  it, skill activation is skipped, and the gate blocks `gh pr create`; other `gh` commands run.
 - Git, and `gh` (GitHub CLI) for `/thoth:self-review`
